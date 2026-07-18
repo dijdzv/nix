@@ -1,5 +1,7 @@
 #include "nix/fetchers/git-utils.hh"
+#include "nix/util/environment-variables.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/finally.hh"
 #include <gmock/gmock.h>
 #include <git2/global.h>
 #include <git2/repository.h>
@@ -14,6 +16,9 @@
 
 #include <git2/blob.h>
 #include <git2/tree.h>
+
+#include <boost/asio.hpp>
+#include <thread>
 
 namespace nix {
 
@@ -232,6 +237,56 @@ TEST(GitUtils, isLegalRefName)
     ASSERT_FALSE(isLegalRefName("*/foo/*"));
     ASSERT_FALSE(isLegalRefName("/foo"));
     ASSERT_FALSE(isLegalRefName(""));
+}
+
+TEST(GitUtils, resolveRemoteRefUsesHttpsProxyFromEnvironment)
+{
+    namespace asio = boost::asio;
+    using asio::ip::tcp;
+
+    auto setVariable = [](const char * name, const std::optional<std::string> & value) {
+#ifdef _WIN32
+        return _putenv_s(name, value ? value->c_str() : "");
+#else
+        return value ? setenv(name, value->c_str(), 1) : unsetenv(name);
+#endif
+    };
+    std::map<std::string, std::optional<std::string>> environment;
+    for (auto name : {"https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"})
+        environment.emplace(name, getEnv(name));
+    auto restoreEnvironment = Finally([&] {
+        for (auto & [name, value] : environment)
+            setVariable(name.c_str(), value);
+    });
+    for (auto & [name, value] : environment)
+        ASSERT_EQ(setVariable(name.c_str(), std::nullopt), 0);
+
+    asio::io_context context;
+    tcp::socket destination(context, tcp::v4());
+    destination.bind({asio::ip::address_v4::loopback(), 0});
+    auto url = fmt("https://127.0.0.1:%d/repo.git", destination.local_endpoint().port());
+    tcp::acceptor listener(context, {asio::ip::address_v4::loopback(), 0});
+    auto proxyUrl = fmt("http://127.0.0.1:%d", listener.local_endpoint().port());
+    ASSERT_EQ(setVariable("https_proxy", proxyUrl), 0);
+    ASSERT_EQ(getEnv("https_proxy"), proxyUrl);
+
+    bool accepted = false;
+    asio::steady_timer timeout(context, std::chrono::seconds(10));
+    timeout.async_wait([&](auto error) {
+        if (!error)
+            listener.cancel();
+    });
+    listener.async_accept([&](auto error, tcp::socket client) {
+        accepted = !error;
+        timeout.cancel();
+    });
+    std::jthread proxy([&] { context.run(); });
+    auto stopProxy = Finally([&] { context.stop(); });
+
+    EXPECT_THROW(resolveRemoteRef(url, "HEAD", {}), Error);
+    proxy.join();
+
+    EXPECT_TRUE(accepted);
 }
 
 } // namespace nix

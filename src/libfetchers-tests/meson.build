@@ -36,6 +36,10 @@ deps_private += gtest
 libgit2 = dependency('libgit2')
 deps_private += libgit2
 
+if host_machine.system() == 'windows'
+  deps_private += cxx.find_library('ws2_32')
+endif
+
 subdir('nix-meson-build-support/common')
 
 sources = files(
